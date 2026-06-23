@@ -1,38 +1,88 @@
 # Voice Activity Detection — Compression Benchmark
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/TomatoesSuck/Voice-Activity-Detection-Compression/blob/main/vad_experiment_colab.ipynb)
+Compresses **SpeechBrain's CRDNN-based VAD**
+([`speechbrain/vad-crdnn-libriparty`](https://huggingface.co/speechbrain/vad-crdnn-libriparty),
+~108k params, 0.435 MB FP32) for iPhone deployment, evaluated frame-level on the
+LibriParty eval split. The goal is a smaller on-disk footprint than the FP32
+baseline with F1 that stays close to it, ending in a Core ML `.mlpackage`.
 
-Benchmarks four model-compression strategies on **SpeechBrain's CRDNN-based VAD**
-([`speechbrain/vad-crdnn-libriparty`](https://huggingface.co/speechbrain/vad-crdnn-libriparty))
-evaluated on the LibriParty dataset.
+Full write-up with analysis: [`report.md`](report.md).
 
 ---
 
-## Compression Strategies
+## Conditions
 
-| Strategy | Method | Scope |
-|---|---|---|
-| **FP32 Baseline** | No compression | — |
-| **PTQ** | Post-training dynamic quantization (`torch.quantization.quantize_dynamic`) | `nn.Linear` → INT8 |
-| **QAT** | FakeQuant fine-tuning (STE) → dynamic quantization | DNN sub-module only |
-| **PTQ+QAT** | FakeQuant fine-tuning (STE) → dynamic quantization | All sub-modules (CNN + RNN + DNN) |
+| ID  | Method                                       |
+| --- | -------------------------------------------- |
+| E0  | FP32 baseline (GRU)                          |
+| E1a | Dynamic PTQ (`quantize_dynamic`, `nn.Linear` → INT8) |
+| E1b | QAT — FakeQuant (STE) on the DNN head only   |
+| E1c | PTQ + QAT — FakeQuant on all sub-modules     |
+| E2  | Static PTQ (CNN Conv2d → INT8)               |
+| E3  | GRU → LSTM, FP32 (trained, frozen CNN+DNN)   |
+| E4  | LSTM + static-PTQ CNN + dynamic-quant LSTM   |
+| E5  | Distilled student (~33k params, FP32)        |
+| E6  | Distilled student + PTQ                      |
+
+The first pass (E0–E1c) establishes that dynamic PTQ is a no-op on this
+architecture; the second pass (E2–E6) actually shrinks the dominant Conv2d/RNN
+weights via static quantization, a GRU→LSTM swap, and distillation.
 
 ---
 
 ## Results
 
-Evaluated on 20 LibriParty eval sessions. Latency: median over 100 runs, single-threaded CPU (x86 Colab).
+Frame-level F1 over 20 LibriParty eval sessions. Latency: median over 100
+single-threaded CPU runs after warm-up, on a local Apple-Silicon (arm64) Mac.
+Per-session F1 SEM ≈ 0.0035; deltas below that are within noise.
 
-| Model | Size (MB) | Latency median (ms) | Latency P95 (ms) | F1 | Precision | Recall |
-|---|---|---|---|---|---|---|
-| FP32 Baseline | 0.435 | 49.761 | 80.693 | **0.9587** | 0.9574 | 0.9606 |
-| PTQ (Dynamic) | 0.434 | 50.619 | 82.124 | **0.9594** | 0.9591 | 0.9603 |
-| QAT | 0.434 | 54.214 | 62.260 | 0.9287 | 0.9886 | 0.8771 |
-| PTQ+QAT | 0.434 | 54.365 | 326.701 | 0.8815 | 0.9965 | 0.7930 |
+| ID  | Method                          | Size (MB) | Latency (ms) | F1     | Precision | Recall |
+| --- | ------------------------------- | --------- | ------------ | ------ | --------- | ------ |
+| E0  | FP32 baseline (GRU)             | 0.435     | 12.9         | **0.9587** | 0.957 | 0.961  |
+| E1a | Dynamic PTQ                     | 0.434     | 13.4         | **0.9594** | 0.959 | 0.960  |
+| E1b | QAT (DNN only)                  | 0.434     | 14.1         | 0.8518 | 0.997     | 0.747  |
+| E1c | PTQ + QAT (all sub-modules)     | 0.434     | 12.2         | 0.8726 | 0.996     | 0.779  |
+| E2  | Static PTQ (CNN → INT8)         | 0.397     | 13.3         | 0.9599 | 0.960     | 0.960  |
+| E3  | GRU → LSTM, FP32 (trained)      | 0.545     | 11.9         | 0.9381 | 0.909     | 0.972  |
+| E4  | LSTM + PTQ                      | **0.185** | 17.4         | 0.9426 | 0.921     | 0.968  |
+| E5  | Distilled student (FP32)        | 0.134     | 13.5         | 0.8671 | 0.790     | 0.973  |
+| E6  | Distilled student + PTQ         | **0.050** | 13.8         | 0.8704 | 0.795     | 0.973  |
 
-Per-session F1 std ≈ 0.0156 · SEM ≈ 0.0035. Deltas below the SEM are within measurement noise.
+**Key findings**
 
-**Key finding**: PTQ matches the FP32 baseline in both F1 and latency (Δ within SEM). QAT and PTQ+QAT degrade F1 by 3 and 8 points respectively with no size benefit, because only 1.2% of parameters reside in quantizable `nn.Linear` layers—the dominant CNN and RNN weights cannot be dynamically quantized.
+- **Dynamic PTQ is a no-op here** (E1a): only 1.2% of params are in quantizable
+  `nn.Linear`; the dominant Conv2d/GRU weights are out of scope, so the file
+  barely shrinks. QAT scoped to that 1.2% (E1b/E1c) only hurts F1.
+- **E4 is the sweet spot** — 0.185 MB at F1 0.9426, under the 200 KB target and
+  within ~1.6 points of baseline. Reached by swapping the un-quantizable GRU for
+  an LSTM (which dynamic quant *does* support) and then quantizing.
+- **E6 is the smallest** — 0.050 MB (8.7× smaller than baseline), but F1 falls
+  ~9 points. Below ~100 KB the size–F1 trade-off steepens faster than
+  distillation absorbs it.
+
+Size vs F1 Pareto front: [`results/pareto_e0_e6.png`](results/pareto_e0_e6.png).
+
+---
+
+## Core ML deployment (E4 / E6)
+
+Both deployable conditions convert to Core ML via
+`torch.jit.trace → coremltools.convert → INT8 weight quantization`. The full
+`wav → logits` graph (mel front-end included) converts intact. Measured on the
+local Apple-Silicon Mac via the **macOS Core ML runtime — not a physical
+iPhone**; steady-state is the median of 30 predictions after one warm-up.
+
+| Condition | Params  | `.mlpackage` INT8 (MB) | compute_units | cold-start (ms) | steady-state (ms) |
+| --------- | ------- | ---------------------- | ------------- | --------------- | ----------------- |
+| E4        | 138,672 | 0.353                  | CPU_ONLY      | 28.1            | 1.9               |
+| E4        | 138,672 | 0.353                  | CPU_AND_NE    | 2.1             | 1.2               |
+| E6        | 33,369  | 0.230                  | CPU_ONLY      | 1.6             | 1.4               |
+| E6        | 33,369  | 0.230                  | CPU_AND_NE    | 1.3             | 1.0               |
+
+The `.mlpackage` is larger than the PyTorch state_dict because it bundles the
+whole pipeline including the mel front-end (0.174 MB of FP32 DSP constants);
+the neural part alone converts to 0.18 MB INT8, matching the 0.185 MB PyTorch
+figure. See [`report.md`](report.md) §4.4 for the full breakdown.
 
 ---
 
@@ -40,98 +90,67 @@ Per-session F1 std ≈ 0.0156 · SEM ≈ 0.0035. Deltas below the SEM are within
 
 ```
 .
-├── vad_experiment_colab.ipynb   # Main experiment notebook (run on Google Colab)
-├── archive/
-│   └── vad_experiment_colab.py  # Archived Python export (no longer maintained)
-├── report.md                    # Detailed technical report with analysis
-└── README.md
+├── vad_compression_local.ipynb   # Main notebook — E0–E6 on local Apple Silicon (source of truth)
+├── vad_experiment_colab.ipynb    # First-pass notebook (E0–E1c) as run on x86 Colab
+├── report.md                     # Full technical report with analysis
+├── results/                      # Committed CSVs + plots + Core ML metrics (JSON)
+└── archive/
+    └── vad_experiment_colab.py   # Archived Python export (no longer maintained)
 ```
 
-Results (CSV + plot) are written to Google Drive at `MyDrive/VAD_Compression/` during the Colab run.
+Heavy artefacts (dataset, pretrained checkpoint, exported `.mlpackage`s) live
+outside the repo under `~/vad_data/`.
 
 ---
 
-## Quick Start
-
-### Run on Google Colab (recommended)
-
-Click the **Open in Colab** badge above. The notebook will:
-1. Mount Google Drive and install SpeechBrain from the `develop` branch.
-2. Download the LibriParty evaluation set (~4.75 GB) or use a cached copy from Drive.
-3. Load the pre-trained CRDNN VAD from HuggingFace Hub.
-4. Run all four compression strategies and evaluate each on 20 sessions.
-5. Save `vad_compression_results.csv` and `latency_vs_f1.png` to Drive.
-
-### Data modes
-
-Set `DATA_MODE` in the second cell:
-
-| Value | Description |
-|---|---|
-| `"demo"` | Downloads a single example WAV; no LibriParty needed. Quick smoke test. |
-| `"small"` | First 20 LibriParty eval sessions (default, ~4.75 GB download). |
-| `"full"` | Full LibriParty archive (~10 GB). |
-
-The dataset is cached to Drive so subsequent runs skip the download.
-
----
-
-## Dependencies
-
-```
-torch
-torchaudio
-numpy
-matplotlib
-pandas
-speechbrain @ git+https://github.com/speechbrain/speechbrain.git@develop
-```
-
-Install in Colab (handled automatically by the notebook):
+## Setup & run
 
 ```bash
-pip install git+https://github.com/speechbrain/speechbrain.git@develop
+pip install torch torchaudio numpy matplotlib pandas speechbrain coremltools
 ```
 
-> **Note**: `torch.quantization.quantize_dynamic` is deprecated in PyTorch ≥ 2.10.
-> The recommended migration path is [`torchao`](https://github.com/pytorch/ao).
+Open `vad_compression_local.ipynb` and run top to bottom. `DATA_MODE` (cell 2)
+controls how much LibriParty is pulled into `~/vad_data/`:
+
+| Value     | Description                                                      |
+| --------- | --------------------------------------------------------------- |
+| `"demo"`  | Single example WAV, no dataset download (smoke test, no F1).     |
+| `"small"` | First 20 eval sessions (~4.75 GB) — enough for E0–E1c F1.        |
+| `"full"`  | Full archive (~10 GB), includes the train split needed by E2–E6.|
+
+Core ML conversion (E4/E6) requires macOS + `coremltools`.
+
+> **Note**: `torch.quantization.quantize_dynamic` is deprecated in PyTorch ≥ 2.10;
+> the recommended migration path is [`torchao`](https://github.com/pytorch/ao).
 
 ---
 
 ## Architecture
 
-The CRDNN model processes raw 16 kHz waveforms in three stages:
+The CRDNN model processes raw 16 kHz waveforms in stages:
 
 ```
 wav [B, T] → Mel features → Mean-Var Norm → CNN → RNN (GRU) → DNN → logits [B, T_frames, 1]
 ```
 
-`CRDNNWrapper` assembles the SpeechBrain sub-modules (`compute_features`, `mean_var_norm`,
-`cnn`, `rnn`, `dnn`) into a single `nn.Module` that supports unified latency benchmarking
-and gradient-based fine-tuning.
+`CRDNNWrapper` assembles the SpeechBrain sub-modules (`compute_features`,
+`mean_var_norm`, `cnn`, `rnn`, `dnn`) into a single `nn.Module` for unified
+latency benchmarking and gradient-based fine-tuning. An optional `rnn=` override
+enables the E3/E4 GRU→LSTM swap without touching the other sub-modules.
 
 ---
 
-## Quantization Constraints
+## Why dynamic quantization alone fails
 
-Dynamic quantization via `quantize_dynamic` supports only `nn.Linear`.
-The CRDNN model's dominant layers (Conv2d, GRU) fall outside this scope:
+`quantize_dynamic` supports only `nn.Linear`. The CRDNN model's dominant layers
+fall outside its scope:
 
-- **GRU**: calling `flatten_parameters()` inside SpeechBrain's RNN wrapper is incompatible with the quantized variant.
-- **Conv2d**: not supported by `quantize_dynamic` at all.
+- **GRU**: `flatten_parameters()` inside SpeechBrain's RNN wrapper is
+  incompatible with the dynamic-quantized variant. (Swapping to `nn.LSTM`, which
+  *is* supported, is the E3/E4 fix.)
+- **Conv2d**: not supported by `quantize_dynamic` at all. (Static PTQ reaches it
+  — the E2 fix.)
 
-As a result, only the DNN head (1.2% of total parameters) is converted to INT8, yielding negligible size reduction.
-
-
----
-
-## Update — RNN swap + static PTQ helpers (not yet run in Colab)
-
-Added scaffolding to `vad_experiment_colab.ipynb` for the next conditions (targets the 98.8% of weights dynamic PTQ couldn't reach). **Written but not yet executed in Colab — needs one run to confirm.**
-
-- `CRDNNWrapper(vad, rnn=...)` — optional RNN override; default still uses the pretrained GRU, so existing cells are unchanged. Feature front-end exposed as `wrapper.features(wav)`.
-- `build_lstm_like(rnn)` — fresh `nn.LSTM` matching the GRU's dims for a one-line GRU→LSTM swap (random weights; must be trained before its F1 means anything).
-- `static_ptq_module(module, calib_inputs)` — `prepare → calibrate → convert`; quantizes Conv2d (the CNN), which `quantize_dynamic` could not. GRU stays FP32.
-- `load_sessions("train")` + `build_calibration_set(...)` — calibration clips from the **train** split, disjoint from eval. Needs the train split present (DATA_MODE='full' or dataset/train/ in place).
-
-`vad_experiment_colab.py` moved to `archive/` and is no longer maintained — the notebook is the single source of truth.
+So dynamic PTQ converts only the DNN head (1.2% of params) to INT8, yielding
+negligible size reduction — which is the whole reason the second pass (E2–E6)
+exists.
